@@ -1,5 +1,4 @@
 using System.Web.Http;
-using System.Web.Http.Cors;
 using Microsoft.Owin;
 using Microsoft.Owin.Cors;
 using Newtonsoft.Json;
@@ -12,28 +11,22 @@ using SinerfinGatewayCLR.Services;
 
 namespace SinerfinGatewayCLR
 {
-    /// <summary>
-    /// Clase de arranque OWIN — equivalente a WebApiConfig + Program.cs de .NET Core.
-    /// Es invocada por Microsoft.Owin.Hosting.WebApp.Start() desde GatewayService.
-    /// </summary>
     public class OwinStartup
     {
         public void Configuration(IAppBuilder app)
         {
-            // ── CORS (igual que el .NET Core: AllowAny*) ─────────────────
+            // ── CORS ──────────────────────────────────────────────────────
             app.UseCors(CorsOptions.AllowAll);
 
-            // ── Web API 2 config ─────────────────────────────────────────
+            // ── Web API 2 ─────────────────────────────────────────────────
             var config = new HttpConfiguration();
 
-            // JSON camelCase + UTC (Newtonsoft.Json)
             var json = config.Formatters.JsonFormatter;
             json.SerializerSettings.ContractResolver     = new CamelCasePropertyNamesContractResolver();
             json.SerializerSettings.DateTimeZoneHandling = DateTimeZoneHandling.Utc;
             json.SerializerSettings.NullValueHandling    = NullValueHandling.Ignore;
             config.Formatters.Remove(config.Formatters.XmlFormatter);
 
-            // Rutas por atributo + fallback convencional
             config.MapHttpAttributeRoutes();
             config.Routes.MapHttpRoute(
                 name: "DefaultApi",
@@ -41,10 +34,11 @@ namespace SinerfinGatewayCLR
                 defaults: new { id = RouteParameter.Optional }
             );
 
-            // Tracing — Instana CLR agent hookea System.Diagnostics.Trace
-            config.EnableSystemDiagnosticsTracing();
+            // NOTA: EnableSystemDiagnosticsTracing() es solo para IIS-hosted.
+            // En OWIN self-host Instana instrumenta directamente el HttpListener
+            // y el pipeline de Web API sin necesidad de este metodo.
 
-            // ── Inyectar servicios singleton ─────────────────────────────
+            // ── Servicios singleton ───────────────────────────────────────
             var baseUrl = System.Configuration.ConfigurationManager
                               .AppSettings["Sinerfin:BaseUrl"]
                           ?? "http://192.168.1.190:8080/sinerfin2-1.0/";

@@ -8,16 +8,6 @@ using SinerfinGatewayCLR.Services;
 
 namespace SinerfinGatewayCLR.Controllers
 {
-    /// <summary>
-    /// Equivalente al PagoController de .NET Core.
-    /// Mismo flujo: validar tarjeta -> consultar saldo -> registrar retiro.
-    /// Usa ApiController (Web API 2) en lugar de ControllerBase (ASP.NET Core).
-    ///
-    /// Instana instrumenta automaticamente:
-    ///   - El entry span HTTP al recibir POST /api/pago
-    ///   - Los exit spans de SinerfinClient (HttpClient) y MqService (HttpClient MQ)
-    ///   - Los exit spans de KafkaService (Confluent.Kafka)
-    /// </summary>
     [EnableCors(origins: "*", headers: "*", methods: "*")]
     [RoutePrefix("api/pago")]
     public class PagoController : ApiController
@@ -39,56 +29,56 @@ namespace SinerfinGatewayCLR.Controllers
 
         // POST /api/pago
         [HttpPost, Route("")]
-        public IHttpActionResult ProcesarPago([FromBody] PagoRequest req)
+        public HttpResponseMessage ProcesarPago([FromBody] PagoRequest req)
         {
             if (req == null)
-                return BadRequest("Body requerido");
+                return Request.CreateErrorResponse(HttpStatusCode.BadRequest, "Body requerido");
 
             System.Diagnostics.Trace.TraceInformation(
                 "[PagoController] Procesando pago cedula={0} monto={1}",
                 req.Cedula, req.Monto);
 
-            // ── 1. Validar tarjeta ──────────────────────────────────────────
+            // ── 1. Validar tarjeta ──────────────────────────────────────
             if (!_validator.ValidarLuhn(req.NumeroTarjeta))
             {
                 _kafka.PublicarAuditoria("PAGO_RECHAZADO_TARJETA",
                     "Luhn invalido cedula=" + req.Cedula);
-                return BadRequest(Rechazado("Numero de tarjeta invalido",
-                    req.NumeroTarjeta, req.Monto));
+                return Request.CreateResponse(HttpStatusCode.BadRequest,
+                    Rechazado("Numero de tarjeta invalido", req.NumeroTarjeta, req.Monto));
             }
 
             if (!_validator.ValidarFecha(req.FechaExpiracion))
             {
                 _kafka.PublicarAuditoria("PAGO_RECHAZADO_TARJETA",
                     "Tarjeta vencida cedula=" + req.Cedula);
-                return BadRequest(Rechazado("Tarjeta vencida o fecha invalida",
-                    req.NumeroTarjeta, req.Monto));
+                return Request.CreateResponse(HttpStatusCode.BadRequest,
+                    Rechazado("Tarjeta vencida o fecha invalida", req.NumeroTarjeta, req.Monto));
             }
 
             if (!_validator.ValidarCvv(req.Cvv, req.NumeroTarjeta))
             {
                 _kafka.PublicarAuditoria("PAGO_RECHAZADO_TARJETA",
                     "CVV invalido cedula=" + req.Cedula);
-                return BadRequest(Rechazado("CVV invalido",
-                    req.NumeroTarjeta, req.Monto));
+                return Request.CreateResponse(HttpStatusCode.BadRequest,
+                    Rechazado("CVV invalido", req.NumeroTarjeta, req.Monto));
             }
 
             if (req.Monto <= 0)
-                return BadRequest(Rechazado("El monto debe ser mayor a 0",
-                    req.NumeroTarjeta, req.Monto));
+                return Request.CreateResponse(HttpStatusCode.BadRequest,
+                    Rechazado("El monto debe ser mayor a 0", req.NumeroTarjeta, req.Monto));
 
-            var banco    = _validator.DetectarBanco(req.NumeroTarjeta);
+            var banco     = _validator.DetectarBanco(req.NumeroTarjeta);
             var numSinEsp = req.NumeroTarjeta.Replace(" ", "");
-            var ultimos4 = numSinEsp.Length >= 4
+            var ultimos4  = numSinEsp.Length >= 4
                 ? numSinEsp.Substring(numSinEsp.Length - 4) : "????";
 
-            // ── 2. Consultar saldo en sinerfin2 ──────────────────────────
+            // ── 2. Consultar saldo ──────────────────────────────────────
             var saldoInfo = _sinerfin.ObtenerSaldo(req.Cedula);
             if (saldoInfo == null || !saldoInfo.Encontrado)
             {
                 _kafka.PublicarAuditoria("PAGO_RECHAZADO_CLIENTE",
                     "Cliente no encontrado cedula=" + req.Cedula);
-                return Content(HttpStatusCode.NotFound,
+                return Request.CreateResponse(HttpStatusCode.NotFound,
                     Rechazado("Cliente no encontrado en el sistema bancario",
                         req.NumeroTarjeta, req.Monto));
             }
@@ -98,15 +88,15 @@ namespace SinerfinGatewayCLR.Controllers
                 _kafka.PublicarAuditoria("PAGO_RECHAZADO_SALDO",
                     string.Format("Saldo insuficiente cedula={0} saldo={1} monto={2}",
                         req.Cedula, saldoInfo.Saldo, req.Monto));
-                return Content(HttpStatusCode.UnprocessableEntity,
+                // 422 Unprocessable Entity — no existe como enum en .NET 4.8, usar cast
+                return Request.CreateResponse((HttpStatusCode)422,
                     Rechazado(
                         string.Format("Saldo insuficiente. Disponible: ${0:F2}", saldoInfo.Saldo),
                         req.NumeroTarjeta, req.Monto));
             }
 
-            // ── 3. Registrar retiro en sinerfin2 ─────────────────────────
-            var txResp = _sinerfin.RegistrarPago(
-                req.Cedula, req.NombreTitular, req.Monto);
+            // ── 3. Registrar retiro ─────────────────────────────────────
+            var txResp = _sinerfin.RegistrarPago(req.Cedula, req.NombreTitular, req.Monto);
 
             if (txResp == null || !txResp.Ok)
             {
@@ -115,30 +105,25 @@ namespace SinerfinGatewayCLR.Controllers
                     "[PagoController] Transaccion rechazada: {0}", motivo);
                 _kafka.PublicarAuditoria("PAGO_ERROR_TRANSACCION",
                     "cedula=" + req.Cedula + " motivo=" + motivo);
-
-                var statusCode = txResp == null
-                    ? HttpStatusCode.BadGateway
-                    : (HttpStatusCode)422;
-                return Content(statusCode,
+                var sc = txResp == null ? HttpStatusCode.BadGateway : (HttpStatusCode)422;
+                return Request.CreateResponse(sc,
                     Rechazado(motivo, req.NumeroTarjeta, req.Monto));
             }
 
-            // ── 4. Pago aprobado ───────────────────────────────────────────
+            // ── 4. Pago aprobado ────────────────────────────────────────
             var codigo = _validator.GenerarCodigoAutorizacion();
 
             _kafka.PublicarPago(req.Cedula, banco, ultimos4,
                 req.Monto, true, codigo, "sinerfin2");
 
-            // Exit span: .NET CLR -> IBM MQ -> Java (trace distribuido en Instana)
             _mq.PublicarPagoRequest(
-                req.Cedula, req.NombreTitular, req.Monto,
-                "POSTGRES", codigo);
+                req.Cedula, req.NombreTitular, req.Monto, "POSTGRES", codigo);
 
             System.Diagnostics.Trace.TraceInformation(
                 "[PagoController] Pago APROBADO cedula={0} monto={1} codigo={2}",
                 req.Cedula, req.Monto, codigo);
 
-            return Ok(new PagoResponse
+            return Request.CreateResponse(HttpStatusCode.OK, new PagoResponse
             {
                 Aprobado           = true,
                 CodigoAutorizacion = codigo,
@@ -153,44 +138,45 @@ namespace SinerfinGatewayCLR.Controllers
 
         // GET /api/pago/tarjetas?cedula=X
         [HttpGet, Route("tarjetas")]
-        public IHttpActionResult ObtenerTarjetas([FromUri] string cedula)
+        public HttpResponseMessage ObtenerTarjetas([FromUri] string cedula)
         {
             if (string.IsNullOrWhiteSpace(cedula))
-                return BadRequest("cedula requerida");
+                return Request.CreateErrorResponse(HttpStatusCode.BadRequest, "cedula requerida");
 
             try
             {
-                var json = _sinerfin.ObtenerTarjetas(cedula);
+                var json      = _sinerfin.ObtenerTarjetas(cedula);
                 var resultado = json ?? "{\"tarjetas\":[]}";
-                return ResponseMessage(new HttpResponseMessage(HttpStatusCode.OK)
+                return new HttpResponseMessage(HttpStatusCode.OK)
                 {
                     Content = new StringContent(resultado,
                         System.Text.Encoding.UTF8, "application/json")
-                });
+                };
             }
             catch (Exception ex)
             {
                 System.Diagnostics.Trace.TraceWarning(
                     "[PagoController] Error tarjetas: {0}", ex.Message);
-                return Ok(new { tarjetas = new object[0] });
+                return Request.CreateResponse(HttpStatusCode.OK,
+                    new { tarjetas = new object[0] });
             }
         }
 
         // GET /api/pago/saldo?cedula=X
         [HttpGet, Route("saldo")]
-        public IHttpActionResult ConsultarSaldo([FromUri] string cedula)
+        public HttpResponseMessage ConsultarSaldo([FromUri] string cedula)
         {
             if (string.IsNullOrWhiteSpace(cedula))
-                return BadRequest("cedula requerida");
+                return Request.CreateErrorResponse(HttpStatusCode.BadRequest, "cedula requerida");
 
             var saldo = _sinerfin.ObtenerSaldo(cedula);
             if (saldo == null || !saldo.Encontrado)
-                return Content(HttpStatusCode.NotFound, new { encontrado = false });
+                return Request.CreateResponse(HttpStatusCode.NotFound,
+                    new { encontrado = false });
 
-            return Ok(saldo);
+            return Request.CreateResponse(HttpStatusCode.OK, saldo);
         }
 
-        // Helper respuesta de rechazo
         private PagoResponse Rechazado(string mensaje, string numero, decimal monto)
         {
             var n = numero.Replace(" ", "");
